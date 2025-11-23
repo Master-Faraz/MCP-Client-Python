@@ -25,7 +25,7 @@ class MCPClient:
         self.session: Optional[ClientSession] = None
         self.exit_stack = AsyncExitStack()
         self.llm_url = "http://localhost:11435/v1/chat/completions"
-        self.model = "qwen/qwen3-1.7b"
+        self.model = os.getenv("DEFAULT_MODEL", "qwen/qwen3-1.7b")
         self.tools = []
         self.messages = []
         self.logger = logger

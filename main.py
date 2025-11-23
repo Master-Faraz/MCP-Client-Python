@@ -6,14 +6,17 @@ from contextlib import asynccontextmanager
 from services.mcp_client import MCPClient
 from dotenv import load_dotenv
 from pydantic_settings import BaseSettings
+import os
+import httpx
 
 # Load environment variables from a .env file
 load_dotenv()
 
-# Define application settings using Pydantic
+# Defining application settings using Pydantic for typesafety and error logging and handling
 class Settings(BaseSettings):
-    # Path to the MCP server script
-    server_script_path: str = "/home/faraz/Desktop/mcp-server-python/main.py"
+    # Path to my MCP server script 
+    server_script_path: str = os.getenv("MCP_SERVER_PATH") or "Not assigned"
+    
 
 # Initialize settings object
 settings = Settings()
@@ -22,8 +25,10 @@ settings = Settings()
 # Lifespan context manager to manage app startup and shutdown behavior
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+
     # Initialize the MCP client
     client = MCPClient()
+
     try:
         # Attempt to connect to the MCP server
         connected = await client.connect_to_server(settings.server_script_path)
@@ -79,6 +84,9 @@ class ToolCall(BaseModel):
     name: str
     args: Dict[str, Any]
 
+class ModelSelectRequest(BaseModel):
+    model: str
+
 
 # ======================
 # API Route Definitions
@@ -127,9 +135,39 @@ async def health_check():
     """
     return {"status": "Server is running"}
 
+# Getting all the models from LM studios
+@app.get("/getmodels")
+async def get_models():
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{os.getenv("LM_STUDIO_SERVER_ENDPOINT")}/models")
+            response.raise_for_status()  # throws error if response code is not 2xx
+        
+        return response.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Setting the model in mcp client
+@app.post("/setmodel")
+async def set_model(request: ModelSelectRequest):
+    try:
+        # setting this instance -> client = MCPClient()
+        app.state.client.model = request.model
+        app.state.client.messages = []  # (optional but recommended)
+        return {"status": "success", "selected_model": request.model}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # Entry point to run the application with Uvicorn when executed directly uvicorn main:app --reload
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Safely parse PORT from environment; fallback to 8000 if not set or invalid
+    port_env = os.getenv("PORT")
+    try:
+        port = int(port_env) if port_env is not None else 8000
+    except (ValueError, TypeError):
+        port = 8000
+
+    uvicorn.run(app, host="0.0.0.0", port=port)
