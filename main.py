@@ -92,7 +92,7 @@ class ModelSelectRequest(BaseModel):
 # API Route Definitions
 # ======================
 
-# Route: Process user query using local LLM + MCP tools
+# Process user query using local LLM + MCP tools
 @app.post("/query")
 async def process_query(request: QueryRequest):
     """
@@ -105,7 +105,7 @@ async def process_query(request: QueryRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Route: Fetch list of available tools from the MCP server
+#  Fetch list of available tools from the MCP server
 @app.get("/tools")
 async def get_tools():
     """
@@ -127,7 +127,7 @@ async def get_tools():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Route: Health check for API server
+# Health check for API server
 @app.get("/test")
 async def health_check():
     """
@@ -151,15 +151,24 @@ async def get_models():
 @app.post("/setmodel")
 async def set_model(request: ModelSelectRequest):
     try:
-        # setting this instance -> client = MCPClient()
         app.state.client.model = request.model
-        app.state.client.messages = []  # (optional but recommended)
-        return {"status": "success", "selected_model": request.model}
+        app.state.client.messages = []  # Reset conversation
+
+        # Run the tool support test
+        tool_support = await app.state.client.test_tool_support()
+
+        return {
+            "status": "success",
+            "selected_model": request.model,
+            "tool_support": tool_support,
+            "message": "Model loaded. Tool support: {}".format("ENABLED" if tool_support else "DISABLED")
+        }
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Entry point to run the application with Uvicorn when executed directly uvicorn main:app --reload
+# Entry point to run the application with Uvicorn when executed directly -> uv run uvicorn main:app --reload
 if __name__ == "__main__":
     import uvicorn
 

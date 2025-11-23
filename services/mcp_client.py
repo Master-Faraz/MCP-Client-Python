@@ -1,5 +1,5 @@
-import httpx  
-from typing import Optional
+import httpx
+from typing import Optional, Any, Dict, List, Tuple
 from contextlib import AsyncExitStack
 import traceback
 from mcp import ClientSession, StdioServerParameters
@@ -10,57 +10,52 @@ import json
 import os
 
 
+
+
 class MCPClient:
     """
-    Main client class to connect to the MCP server and interact with a local LLM.
-    Handles initialization, tool communication, query processing, LLM calls,
-    and conversation logging.
+    MCPClient with two query-processing strategies to handle LLM tool calls.
+
+    Key features:
+    - Support for mixed tool return formats (text / JSON / other).
+    - Robust parsing for LLM responses produced in several styles (tool_calls, function_call, tool_call, plain content).
+    - Protection against infinite loops (max iterations and clear "second-call" semantics).
+    - Both Version A (recommended) and Version B (compatibility) are provided.
     """
 
-    def __init__(self):
-        """
-        Initializes the MCP client with session management, model settings,
-        and an internal message log for multi-turn conversations.
-        """
+    def __init__(self, llm_url: str | None = None, max_tool_iterations: int = 5):
         self.session: Optional[ClientSession] = None
         self.exit_stack = AsyncExitStack()
-        self.llm_url = "http://localhost:11435/v1/chat/completions"
+        self.llm_url = llm_url or os.getenv("LLM_API_URL") or "http://localhost:11435/v1/chat/completions"
         self.model = os.getenv("DEFAULT_MODEL", "qwen/qwen3-1.7b")
         self.tools = []
-        self.messages = []
+        self.messages: List[Dict[str, Any]] = []
         self.logger = logger
+        self.max_tool_iterations = int(os.getenv("MAX_TOOL_ITERATIONS", str(max_tool_iterations)))
 
+        # For checking the tools supported models
+        self.tool_enabled = False
+
+    # -------------------------
+    # MCP / Server connection
+    # -------------------------
     async def connect_to_server(self, server_script_path: str):
-        """
-        Connects to the MCP server using stdio transport.
-        Spawns the MCP backend process (.py or .js), initializes the session,
-        and loads available tools for the LLM.
-        """
         try:
             is_python = server_script_path.endswith(".py")
-            is_js = server_script_path.endswith(".js")
-            if not (is_python or is_js):
-                raise ValueError("Server script must be a .py or .js file")
+            if not is_python:
+                raise ValueError("Server script must be a .py file")
 
-            command = "python" if is_python else "node"
-            server_params = StdioServerParameters(
-                command=command, args=[server_script_path], env=None
-            )
+            command = "python"
+            server_params = StdioServerParameters(command=command, args=[server_script_path], env=None)
 
-            # Establish stdio-based communication with the MCP server
-            stdio_transport = await self.exit_stack.enter_async_context(
-                stdio_client(server_params)
-            )
+            stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
             self.stdio, self.write = stdio_transport
 
-            # Start MCP client session
-            self.session = await self.exit_stack.enter_async_context(
-                ClientSession(self.stdio, self.write)
-            )
+            self.session = await self.exit_stack.enter_async_context(ClientSession(self.stdio, self.write))
             await self.session.initialize()
             self.logger.info("Connected to MCP server")
 
-            # Load available tools from the server and convert them for OpenAI-compatible format
+            # Load tools
             mcp_tools = await self.get_mcp_tools()
 
             def convert_tool_to_openai(tool):
@@ -69,14 +64,12 @@ class MCPClient:
                     "function": {
                         "name": tool.name,
                         "description": tool.description,
-                        "parameters": tool.inputSchema
-                    }
+                        "parameters": tool.inputSchema,
+                    },
                 }
 
-            self.tools = [convert_tool_to_openai(tool) for tool in mcp_tools]
-            self.logger.info(
-                f"Available tools: {[t['function']['name'] for t in self.tools]}"
-            )
+            self.tools = [convert_tool_to_openai(t) for t in mcp_tools]
+            self.logger.info(f"Available tools: {[t['function']['name'] for t in self.tools]}")
 
             return True
 
@@ -86,9 +79,6 @@ class MCPClient:
             raise
 
     async def get_mcp_tools(self):
-        """
-        Retrieves the list of available tools from the MCP server.
-        """
         try:
             response = await self.session.list_tools()
             return response.tools
@@ -96,172 +86,247 @@ class MCPClient:
             self.logger.error(f"Error getting MCP tools: {e}")
             raise
 
-    async def process_query(self, query: str):
+    # -------------------------
+    # Helpers for parsing LLM output
+    # -------------------------
+    def _parse_message_for_tools_and_text(self, message: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         """
-        Processes a user query by:
-        - Sending it to the LLM
-        - Detecting tool calls (if any)
-        - Executing tools and feeding results back into the conversation
-        - Repeating until LLM returns a final text answer
+        Normalizes different LLM outputs into a list of tool calls and an optional text result.
+
+        Supports message shapes like:
+          - {"tool_calls": [...]} (your Qwen example)
+          - {"function_call": {...}} (OpenAI-style)
+          - {"content": "..."} (plain text)
+          - {"content": [{...}, {...}]} (list with typed content)
+
+        Returns: (tool_calls_list, text_or_None)
+        - tool_calls_list: list of {"name":..., "arguments": {...}}
+        - text_or_None: assistant text if present
+        """
+
+        tool_calls: List[Dict[str, Any]] = []
+        text_result: Optional[str] = None
+
+        # 1) explicit tool_calls key (qwen-like)
+        if "tool_calls" in message and isinstance(message["tool_calls"], list):
+            for tc in message["tool_calls"]:
+                func = tc.get("function", {})
+                name = func.get("name") or tc.get("name")
+                args_raw = func.get("arguments") or tc.get("arguments") or tc.get("args")
+                parsed_args = None
+                if args_raw is not None:
+                    try:
+                        parsed_args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                    except Exception:
+                        parsed_args = args_raw
+                tool_calls.append({"name": name, "arguments": parsed_args})
+
+        # 2) OpenAI-style function_call in message
+        elif "function_call" in message and isinstance(message["function_call"], dict):
+            fc = message["function_call"]
+            name = fc.get("name")
+            args_raw = fc.get("arguments")
+            parsed_args = None
+            if args_raw is not None:
+                try:
+                    parsed_args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                except Exception:
+                    parsed_args = args_raw
+            tool_calls.append({"name": name, "arguments": parsed_args})
+
+        # 3) If content is a list with typed entries (some tool-enabled models)
+        elif "content" in message and isinstance(message["content"], list):
+            for entry in message["content"]:
+                if isinstance(entry, dict) and entry.get("type") == "tool_use":
+                    tool_calls.append({"name": entry.get("name"), "arguments": entry.get("input")})
+                elif isinstance(entry, dict) and entry.get("type") == "text":
+                    text_result = (text_result or "") + entry.get("text", "")
+                elif isinstance(entry, str):
+                    text_result = (text_result or "") + entry
+
+        # 4) If content is plain text
+        elif "content" in message and isinstance(message["content"], str):
+            text_result = message["content"]
+
+        # 5) Fallback: message may directly contain a text key
+        elif "text" in message:
+            text_result = message.get("text")
+
+        return tool_calls, text_result
+
+    async def _execute_tool(self, tool_name: str, tool_args: Any) -> str:
+        """
+        Executes an MCP tool via session.call_tool and returns a textual representation.
+        Handles several return types gracefully.
         """
         try:
-            self.logger.info(f"Processing query: {query}")
-            user_message = {"role": "user", "content": query}
-            self.messages = [user_message]
+            result = await self.session.call_tool(tool_name, tool_args or {})
 
-            while True:
-                response = await self.call_llm()
+            # result.content might be a list or object depending on tool implementation
+            if hasattr(result, "content"):
+                content = result.content
+            else:
+                content = result
 
-                # If response is a final message (text only), log and return
-                if response.content and response.content[0]["type"] == "text" and len(response.content) == 1:
-                    assistant_message = {
-                        "role": "assistant",
-                        "content": response.content[0]["text"],
-                    }
-                    self.messages.append(assistant_message)
-                    await self.log_conversation()
-                    break
+            # If list, try to join textual parts
+            if isinstance(content, list):
+                pieces: List[str] = []
+                for el in content:
+                    # Many SDK objects have .text or .to_dict
+                    if hasattr(el, "text"):
+                        pieces.append(getattr(el, "text"))
+                    elif isinstance(el, dict):
+                        pieces.append(json.dumps(el, default=str))
+                    else:
+                        pieces.append(str(el))
+                return " ".join(pieces)
 
-                # If LLM requests tool usage
-                for content in response.content:
-                    if content["type"] == "tool_use":
-                        tool_name = content["name"]
-                        tool_args = content["input"]
-                        self.logger.info(f"Calling tool {tool_name} with args {tool_args}")
+            # If it's a string
+            if isinstance(content, str):
+                return content
 
-                        try:
-                            result = await self.session.call_tool(tool_name, tool_args)
+            # If it's JSON-like
+            try:
+                return json.dumps(content, default=str)
+            except Exception:
+                return str(content)
 
-                            # Convert result to plain text for logging and reuse
-                            if isinstance(result.content, list):
-                                result_text = "\n".join(
-                                    tc.text if hasattr(tc, "text") else str(tc)
-                                    for tc in result.content
-                                )
-                            else:
-                                result_text = str(result.content)
+        except Exception as e:
+            self.logger.error(f"Error calling tool {tool_name}: {e}")
+            raise
 
-                            # Log tool result as a new message
-                            self.messages.append({
-                                "role": "tool",
-                                "name": tool_name,
-                                "content": result_text
-                            })
+    # -------------------------
+    # Low-level LLM call
+    # -------------------------
+    async def _call_llm_raw(self, messages: List[Dict[str, Any]], tool_choice: str = "auto") -> Dict[str, Any]:
+        """
+        Make a POST to the LLM endpoint and return the parsed JSON.
+        tool_choice: typically "auto" or "none" (models that support this param)
+        """
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": float(os.getenv("LLM_TEMPERATURE", "0.8")),
+            "tools": self.tools,
+            "tool_choice": tool_choice,
+        }
 
-                            await self.log_conversation()
-                        except Exception as e:
-                            self.logger.error(f"Error calling tool {tool_name}: {e}")
-                            raise
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(self.llm_url, json=payload)
+            resp.raise_for_status()
+            return resp.json()
 
+    # -------------------------
+    # Version A — Universal 2-step workflow (recommended)
+    # -------------------------
+    async def process_query(self, query: str) -> List[Dict[str, Any]]:
+        """
+        1) Send initial messages to LLM with tool definitions (tool_choice="auto").
+        2) If tool_calls are returned: execute them (up to max iterations), append tool results as tool messages.
+        3) After tools executed, call the LLM again with tool_choice="none" to get final text response.
+        4) Return full conversation log as a list of messages.
+        """
+        try:
+            self.logger.info(f"[vA] Processing query: {query}")
+            # self.messages = [{"role": "user", "content": query}]
+            # If tool support is disabled → bypass MCP tools completely
+            if not self.tool_enabled:
+                # Simple LLM call WITHOUT tools
+                self.messages = [{"role": "user", "content": query}]
+                raw = await self._call_llm_raw(self.messages, tool_choice="none")
+                text = raw["choices"][0]["message"].get("content", "")
+                self.messages.append({"role": "assistant", "content": text})
+                return self.messages
+
+            # Otherwise normal tool flow:
+            self.messages = [{"role": "user", "content": query}]
+
+            # first call: allow model to choose tools
+            raw = await self._call_llm_raw(self.messages, tool_choice="auto")
+            choice_msg = raw["choices"][0]["message"]
+            tool_calls, text = self._parse_message_for_tools_and_text(choice_msg)
+
+            # If no tools requested, and there's a text answer, return immediately
+            if not tool_calls and text is not None:
+                self.messages.append({"role": "assistant", "content": text})
+                # await self.log_conversation()
+                return self.messages
+
+            # Execute tool calls (support multiple tool calls returned)
+            iterations = 0
+            while tool_calls and iterations < self.max_tool_iterations:
+                iterations += 1
+                for tc in tool_calls:
+                    name = tc.get("name")
+                    args = tc.get("arguments") or {}
+                    self.logger.info(f"[vA] Executing tool '{name}' with args: {args}")
+                    tool_output_text = await self._execute_tool(name, args)
+
+                    # Append tool message(s) to conversation so LLM can see the result
+                    self.messages.append({"role": "tool", "name": name, "content": tool_output_text})
+
+                # After executing tools, ask model for a final answer with tool_choice="none"
+                raw2 = await self._call_llm_raw(self.messages, tool_choice="none")
+                choice_msg2 = raw2["choices"][0]["message"]
+                tool_calls, text = self._parse_message_for_tools_and_text(choice_msg2)
+
+                # If model produced a plain text result, append and finish
+                if not tool_calls and text is not None:
+                    self.messages.append({"role": "assistant", "content": text})
+                    # await self.log_conversation()
+                    return self.messages
+
+                # If model still returns tool calls, we'll loop again (up to max iterations)
+
+            # If we exit loop without a final text, return whatever we have (last model text if any)
+            if text:
+                self.messages.append({"role": "assistant", "content": text})
+            # await self.log_conversation()
             return self.messages
 
         except Exception as e:
-            self.logger.error(f"Error processing query: {e}")
+            self.logger.error(f"[vA] Error processing query: {e}")
             raise
 
-    async def call_llm(self):
+
+    async def test_tool_support(self) -> bool:
         """
-        Calls the local LLM (Qwen 1.7b) with current conversation state.
-        Automatically includes tool definitions to enable tool use.
+        Sends a hidden internal prompt to the LLM asking it to call `test_tool`.
+        If the LLM returns a proper tool call, tool support is enabled.
         """
-        try:
-            self.logger.info("Calling LLM")
 
-            payload = {
-                "model": self.model,
-                "messages": self.messages,
-                "temperature": 0.8,
-                "tools": self.tools,
-                "tool_choice": "auto"
-            }
+        test_prompt = "Please call the tool `test_tool` with message \"HELLO_MCP\"."
 
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                response = await client.post(self.llm_url, json=payload)
-                response.raise_for_status()
-                data = response.json()
-
-            message = data["choices"][0]["message"]
-
-            # Wrap the response in a class to standardize structure
-            class CustomResponse:
-                def __init__(self, message):
-                    self.content = []
-
-                    if "tool_calls" in message:
-                        for tool_call in message["tool_calls"]:
-                            self.content.append({
-                                "type": "tool_use",
-                                "id": tool_call.get("id"),
-                                "name": tool_call["function"]["name"],
-                                "input": json.loads(tool_call["function"]["arguments"])
-                            })
-                    elif "content" in message:
-                        self.content.append({
-                            "type": "text",
-                            "text": message["content"]
-                        })
-
-                def to_dict(self):
-                    return {"content": self.content}
-
-            return CustomResponse(message)
-
-        except Exception as e:
-            self.logger.error(f"Error calling LLM: {e}")
-            raise
-
-    async def cleanup(self):
-        """
-        Performs cleanup of all open contexts and connections.
-        Called when the app shuts down.
-        """
-        try:
-            await self.exit_stack.aclose()
-            self.logger.info("Disconnected from MCP server")
-        except Exception as e:
-            self.logger.error(f"Error during cleanup: {e}")
-            traceback.print_exc()
-            raise
-
-    async def log_conversation(self):
-        """
-        Saves the conversation history to a timestamped JSON file.
-        Helps with auditing and debugging.
-        """
-        os.makedirs("conversations", exist_ok=True)
-        serializable_conversation = []
-
-        for message in self.messages:
-            try:
-                serializable_message = {"role": message["role"], "content": []}
-
-                if isinstance(message["content"], str):
-                    serializable_message["content"] = message["content"]
-                elif isinstance(message["content"], list):
-                    for content_item in message["content"]:
-                        if hasattr(content_item, "to_dict"):
-                            serializable_message["content"].append(content_item.to_dict())
-                        elif hasattr(content_item, "dict"):
-                            serializable_message["content"].append(content_item.dict())
-                        elif hasattr(content_item, "model_dump"):
-                            serializable_message["content"].append(content_item.model_dump())
-                        else:
-                            serializable_message["content"].append(content_item)
-
-                serializable_conversation.append(serializable_message)
-
-            except Exception as e:
-                self.logger.error(f"Error processing message: {str(e)}")
-                self.logger.debug(f"Message content: {message}")
-                raise
-
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        filepath = os.path.join("conversations", f"conversation_{timestamp}.json")
+        messages = [
+            {"role": "system", "content": "Internal tool support check."},
+            {"role": "user", "content": test_prompt}
+        ]
 
         try:
-            with open(filepath, "w") as f:
-                json.dump(serializable_conversation, f, indent=2, default=str)
-        except Exception as e:
-            self.logger.error(f"Error writing conversation to file: {str(e)}")
-            self.logger.debug(f"Serializable conversation: {serializable_conversation}")
-            raise
+            # Ask the model to call the tool
+            raw = await self._call_llm_raw(messages, tool_choice="auto")
+            msg = raw["choices"][0]["message"]
+
+            tool_calls, _ = self._parse_message_for_tools_and_text(msg)
+
+            # If no structured tool call → no tool support
+            if not tool_calls:
+                self.tool_enabled = False
+                return False
+
+            tc = tool_calls[0]
+
+            # The model must attempt to call EXACTLY `test_tool`
+            if tc.get("name") != "test_tool":
+                self.tool_enabled = False
+                return False
+
+            # Execute tool (this ensures MCP path works)
+            await self._execute_tool("test_tool", {"message": "HELLO_MCP"})
+
+            self.tool_enabled = True
+            return True
+
+        except Exception:
+            self.tool_enabled = False
+            return False
