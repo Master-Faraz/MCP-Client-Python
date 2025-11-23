@@ -1,3 +1,13 @@
+# MCP Client — Two Versions (A and B)
+# File: services/mcp_client.py
+# NOTE: This file implements two different workflows for tool-enabled LLMs:
+# - process_query_vA: Universal 2-step workflow (recommended)
+# - process_query_vB: Patched while-loop workflow (keeps your original structure)
+# Default process_query() delegates to process_query_vA. You can switch to vB for testing.
+
+# Uploaded file reference (local):
+# file:///mnt/data/600aa43c-b09e-40b8-83b3-fdc338edc337.png
+
 import httpx
 from typing import Optional, Any, Dict, List, Tuple
 from contextlib import AsyncExitStack
@@ -8,8 +18,6 @@ from datetime import datetime
 from utils.logger import logger
 import json
 import os
-
-
 
 
 class MCPClient:
@@ -32,9 +40,6 @@ class MCPClient:
         self.messages: List[Dict[str, Any]] = []
         self.logger = logger
         self.max_tool_iterations = int(os.getenv("MAX_TOOL_ITERATIONS", str(max_tool_iterations)))
-
-        # For checking the tools supported models
-        self.tool_enabled = False
 
     # -------------------------
     # MCP / Server connection
@@ -219,7 +224,7 @@ class MCPClient:
     # -------------------------
     # Version A — Universal 2-step workflow (recommended)
     # -------------------------
-    async def process_query(self, query: str) -> List[Dict[str, Any]]:
+    async def process_query_vA(self, query: str) -> List[Dict[str, Any]]:
         """
         1) Send initial messages to LLM with tool definitions (tool_choice="auto").
         2) If tool_calls are returned: execute them (up to max iterations), append tool results as tool messages.
@@ -228,17 +233,6 @@ class MCPClient:
         """
         try:
             self.logger.info(f"[vA] Processing query: {query}")
-            # self.messages = [{"role": "user", "content": query}]
-            # If tool support is disabled → bypass MCP tools completely
-            if not self.tool_enabled:
-                # Simple LLM call WITHOUT tools
-                self.messages = [{"role": "user", "content": query}]
-                raw = await self._call_llm_raw(self.messages, tool_choice="none")
-                text = raw["choices"][0]["message"].get("content", "")
-                self.messages.append({"role": "assistant", "content": text})
-                return self.messages
-
-            # Otherwise normal tool flow:
             self.messages = [{"role": "user", "content": query}]
 
             # first call: allow model to choose tools
@@ -249,7 +243,7 @@ class MCPClient:
             # If no tools requested, and there's a text answer, return immediately
             if not tool_calls and text is not None:
                 self.messages.append({"role": "assistant", "content": text})
-                # await self.log_conversation()
+                await self.log_conversation()
                 return self.messages
 
             # Execute tool calls (support multiple tool calls returned)
@@ -273,7 +267,7 @@ class MCPClient:
                 # If model produced a plain text result, append and finish
                 if not tool_calls and text is not None:
                     self.messages.append({"role": "assistant", "content": text})
-                    # await self.log_conversation()
+                    await self.log_conversation()
                     return self.messages
 
                 # If model still returns tool calls, we'll loop again (up to max iterations)
@@ -281,52 +275,146 @@ class MCPClient:
             # If we exit loop without a final text, return whatever we have (last model text if any)
             if text:
                 self.messages.append({"role": "assistant", "content": text})
-            # await self.log_conversation()
+            await self.log_conversation()
             return self.messages
 
         except Exception as e:
             self.logger.error(f"[vA] Error processing query: {e}")
             raise
 
-
-    async def test_tool_support(self) -> bool:
+    # -------------------------
+    # Version B — Patched while-loop (compat layer for your original loop)
+    # -------------------------
+    async def process_query_vB(self, query: str) -> List[Dict[str, Any]]:
         """
-        Sends a hidden internal prompt to the LLM asking it to call `test_tool`.
-        If the LLM returns a proper tool call, tool support is enabled.
+        Keeps original while-loop structure but enforces that after tool execution
+        the subsequent LLM call uses tool_choice="none" to reduce repeated tool calls.
+        Adds iteration limits and safer parsing.
         """
+        try:
+            self.logger.info(f"[vB] Processing query: {query}")
+            self.messages = [{"role": "user", "content": query}]
 
-        test_prompt = "Please call the tool `test_tool` with message \"HELLO_MCP\"."
+            iterations = 0
+            while True:
+                iterations += 1
+                if iterations > self.max_tool_iterations * 2:
+                    raise RuntimeError("Too many iterations, aborting to avoid infinite loop")
 
-        messages = [
-            {"role": "system", "content": "Internal tool support check."},
-            {"role": "user", "content": test_prompt}
-        ]
+                raw = await self._call_llm_raw(self.messages, tool_choice="auto")
+                choice_msg = raw["choices"][0]["message"]
+                tool_calls, text = self._parse_message_for_tools_and_text(choice_msg)
+
+                # If it's a final text-only answer
+                if not tool_calls and text is not None:
+                    self.messages.append({"role": "assistant", "content": text})
+                    await self.log_conversation()
+                    break
+
+                # If model requested tool usage, execute them and append tool result(s)
+                if tool_calls:
+                    for tc in tool_calls:
+                        name = tc.get("name")
+                        args = tc.get("arguments") or {}
+                        self.logger.info(f"[vB] Calling tool {name} with args {args}")
+                        tool_output_text = await self._execute_tool(name, args)
+
+                        # Append tool output so the model can use it next turn
+                        self.messages.append({"role": "tool", "name": name, "content": tool_output_text})
+
+                    # AFTER running tools, call again but force model not to call tools
+                    raw2 = await self._call_llm_raw(self.messages, tool_choice="none")
+                    choice_msg2 = raw2["choices"][0]["message"]
+                    tool_calls2, text2 = self._parse_message_for_tools_and_text(choice_msg2)
+
+                    # If final text
+                    if not tool_calls2 and text2 is not None:
+                        self.messages.append({"role": "assistant", "content": text2})
+                        await self.log_conversation()
+                        break
+
+                    # If still tool calls (rare), continue loop but ensure we don't loop forever
+                    tool_calls = tool_calls2
+                    continue
+
+                # Safety fallback
+                self.logger.info("[vB] No tool_calls and no text returned; breaking")
+                break
+
+            return self.messages
+
+        except Exception as e:
+            self.logger.error(f"[vB] Error processing query: {e}")
+            raise
+
+
+    # Default entry point — uses Version A (recommended)
+    async def process_query(self, query: str, mode: str = "A") -> List[Dict[str, Any]]:
+        if mode == "A":
+            return await self.process_query_vA(query)
+        else:
+            return await self.process_query_vB(query)
+
+    # -------------------------
+    # Utilities
+    # -------------------------
+    async def call_llm(self, messages: List[Dict[str, Any]], tool_choice: str = "auto") -> Dict[str, Any]:
+        """Public wrapper for _call_llm_raw that logs and returns JSON."""
+        self.logger.info(f"Calling LLM (model={self.model}, tool_choice={tool_choice}) with {len(messages)} messages")
+        return await self._call_llm_raw(messages, tool_choice=tool_choice)
+
+    async def cleanup(self):
+        try:
+            await self.exit_stack.aclose()
+            self.logger.info("Disconnected from MCP server")
+        except Exception as e:
+            self.logger.error(f"Error during cleanup: {e}")
+            traceback.print_exc()
+            raise
+
+    async def log_conversation(self):
+        os.makedirs("conversations", exist_ok=True)
+        serializable_conversation = []
+
+        for message in self.messages:
+            try:
+                serializable_message = {"role": message.get("role"), "content": []}
+
+                content = message.get("content")
+                if isinstance(content, str):
+                    serializable_message["content"] = content
+                elif isinstance(content, list):
+                    for content_item in content:
+                        if hasattr(content_item, "to_dict"):
+                            serializable_message["content"].append(content_item.to_dict())
+                        elif hasattr(content_item, "dict"):
+                            serializable_message["content"].append(content_item.dict())
+                        elif hasattr(content_item, "model_dump"):
+                            serializable_message["content"].append(content_item.model_dump())
+                        else:
+                            serializable_message["content"].append(content_item)
+                else:
+                    # JSON-serializable fallback
+                    serializable_message["content"] = content
+
+                serializable_conversation.append(serializable_message)
+
+            except Exception as e:
+                self.logger.error(f"Error processing message: {str(e)}")
+                self.logger.debug(f"Message content: {message}")
+                raise
+
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        filepath = os.path.join("conversations", f"conversation_{timestamp}.json")
 
         try:
-            # Ask the model to call the tool
-            raw = await self._call_llm_raw(messages, tool_choice="auto")
-            msg = raw["choices"][0]["message"]
+            with open(filepath, "w") as f:
+                json.dump(serializable_conversation, f, indent=2, default=str)
+            self.logger.info(f"Conversation logged to {filepath}")
+        except Exception as e:
+            self.logger.error(f"Error writing conversation to file: {str(e)}")
+            self.logger.debug(f"Serializable conversation: {serializable_conversation}")
+            raise
 
-            tool_calls, _ = self._parse_message_for_tools_and_text(msg)
 
-            # If no structured tool call → no tool support
-            if not tool_calls:
-                self.tool_enabled = False
-                return False
-
-            tc = tool_calls[0]
-
-            # The model must attempt to call EXACTLY `test_tool`
-            if tc.get("name") != "test_tool":
-                self.tool_enabled = False
-                return False
-
-            # Execute tool (this ensures MCP path works)
-            await self._execute_tool("test_tool", {"message": "HELLO_MCP"})
-
-            self.tool_enabled = True
-            return True
-
-        except Exception:
-            self.tool_enabled = False
-            return False
+# End of MCPClient implementation

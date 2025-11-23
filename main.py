@@ -1,3 +1,5 @@
+# main.py
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -152,16 +154,10 @@ async def get_models():
 async def set_model(request: ModelSelectRequest):
     try:
         app.state.client.model = request.model
-        app.state.client.messages = []  # Reset conversation
-
-        # Run the tool support test
-        tool_support = await app.state.client.test_tool_support()
 
         return {
             "status": "success",
             "selected_model": request.model,
-            "tool_support": tool_support,
-            "message": "Model loaded. Tool support: {}".format("ENABLED" if tool_support else "DISABLED")
         }
 
     except Exception as e:
@@ -180,3 +176,4 @@ if __name__ == "__main__":
         port = 8000
 
     uvicorn.run(app, host="0.0.0.0", port=port)
+
