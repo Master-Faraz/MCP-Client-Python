@@ -9,7 +9,7 @@
 # file:///mnt/data/600aa43c-b09e-40b8-83b3-fdc338edc337.png
 
 import httpx
-from typing import Optional, Any, Dict, List, Tuple
+from typing import Optional, Any, Dict, List, Tuple, AsyncGenerator
 from contextlib import AsyncExitStack
 import traceback
 from mcp import ClientSession, StdioServerParameters
@@ -18,6 +18,7 @@ from datetime import datetime
 from utils.logger import logger
 import json
 import os
+import re
 
 
 class MCPClient:
@@ -159,6 +160,15 @@ class MCPClient:
 
         return tool_calls, text_result
 
+    def _detect_tool_calls_from_streaming_chunks(
+        self, accumulated_message: Dict[str, Any]
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """
+        Detect tool calls from accumulated streaming message chunks.
+        Similar to _parse_message_for_tools_and_text but works with streaming delta accumulation.
+        """
+        return self._parse_message_for_tools_and_text(accumulated_message)
+
     async def _execute_tool(self, tool_name: str, tool_args: Any) -> str:
         """
         Executes an MCP tool via session.call_tool and returns a textual representation.
@@ -220,6 +230,67 @@ class MCPClient:
             resp = await client.post(self.llm_url, json=payload)
             resp.raise_for_status()
             return resp.json()
+
+    # -------------------------
+    # Streaming LLM call
+    # -------------------------
+    async def _stream_llm_raw(
+        self, messages: List[Dict[str, Any]], tool_choice: str = "auto"
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Stream tokens from the LLM endpoint using stream=True.
+        Yields parsed JSON chunks from SSE format.
+        """
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": float(os.getenv("LLM_TEMPERATURE", "0.8")),
+            "tools": self.tools,
+            "tool_choice": tool_choice,
+            "stream": True,
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                async with client.stream("POST", self.llm_url, json=payload) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if not line.strip():
+                            continue
+                        # Handle SSE format: "data: {...}" or just "{...}"
+                        if line.startswith("data: "):
+                            data_str = line[6:]  # Remove "data: " prefix
+                        elif line.startswith("data:"):
+                            data_str = line[5:].strip()
+                        else:
+                            data_str = line.strip()
+                        
+                        # Skip [DONE] marker
+                        if data_str == "[DONE]":
+                            continue
+                        
+                        try:
+                            chunk = json.loads(data_str)
+                            yield chunk
+                        except json.JSONDecodeError:
+                            # Skip malformed JSON chunks
+                            self.logger.debug(f"Skipping malformed chunk: {data_str}")
+                            continue
+        except httpx.ConnectError as e:
+            error_msg = (
+                f"Failed to connect to LLM server at {self.llm_url}. "
+                f"Please ensure LM Studio (or your LLM server) is running and accessible. "
+                f"Error: {str(e)}"
+            )
+            self.logger.error(error_msg)
+            raise ConnectionError(error_msg) from e
+        except httpx.HTTPStatusError as e:
+            error_msg = (
+                f"LLM server returned error status {e.response.status_code}. "
+                f"Response: {e.response.text[:200]}"
+            )
+            self.logger.error(error_msg)
+            raise RuntimeError(error_msg) from e
 
     # -------------------------
     # Version A — Universal 2-step workflow (recommended)
@@ -354,6 +425,175 @@ class MCPClient:
             return await self.process_query_vA(query)
         else:
             return await self.process_query_vB(query)
+
+    # -------------------------
+    # Streaming with tool call support
+    # -------------------------
+    async def stream_query(
+        self, query: str
+    ) -> AsyncGenerator[str, None]:
+        """
+        High-level streaming generator that:
+        1. Takes a user query
+        2. Initializes messages with the user query
+        3. Streams from LLM
+        4. Detects tool calls in streaming chunks
+        5. Pauses streaming when tool call detected
+        6. Executes tool via existing MCP tool logic
+        7. Appends tool output to messages
+        8. Resumes streaming with updated messages
+        9. Continues until LLM signals completion
+        
+        Yields plain text tokens.
+        """
+        try:
+            self.logger.info(f"[Stream] Processing query: {query}")
+            messages = [{"role": "user", "content": query}]
+            
+            iterations = 0
+            accumulated_text = ""
+            
+            while iterations < self.max_tool_iterations * 2:
+                iterations += 1
+                
+                # Accumulate message for tool call detection
+                accumulated_message = {"role": "assistant", "content": ""}
+                tool_calls_detected = []
+                current_text = ""
+                tool_call_accumulator = {}
+                
+                # Stream from LLM
+                async for chunk in self._stream_llm_raw(messages, tool_choice="auto"):
+                    if "choices" not in chunk or not chunk["choices"]:
+                        continue
+                    
+                    delta = chunk["choices"][0].get("delta", {})
+                    finish_reason = chunk["choices"][0].get("finish_reason")
+                    
+                    # Handle content delta (text tokens)
+                    if "content" in delta and delta["content"]:
+                        content_delta = delta["content"]
+                        current_text += content_delta
+                        accumulated_text += content_delta
+                        accumulated_message["content"] = current_text
+                        # Yield text token immediately
+                        yield content_delta
+                    
+                    # Handle tool_calls delta (tool call detection)
+                    if "tool_calls" in delta and delta["tool_calls"]:
+                        for tc_delta in delta["tool_calls"]:
+                            index = tc_delta.get("index", 0)
+                            
+                            # Initialize tool call accumulator if needed
+                            if index not in tool_call_accumulator:
+                                tool_call_accumulator[index] = {
+                                    "id": "",
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""}
+                                }
+                            
+                            # Update ID if present (may come in any delta)
+                            if "id" in tc_delta and tc_delta["id"]:
+                                tool_call_accumulator[index]["id"] = tc_delta["id"]
+                            
+                            # Accumulate function name
+                            if "function" in tc_delta and "name" in tc_delta["function"]:
+                                tool_call_accumulator[index]["function"]["name"] = tc_delta["function"]["name"]
+                            
+                            # Accumulate function arguments
+                            if "function" in tc_delta and "arguments" in tc_delta["function"]:
+                                tool_call_accumulator[index]["function"]["arguments"] += tc_delta["function"]["arguments"]
+                    
+                    # Check finish reason
+                    if finish_reason:
+                        # Build complete tool_calls list from accumulator
+                        if tool_call_accumulator:
+                            accumulated_message["tool_calls"] = [
+                                {
+                                    "id": tc.get("id", ""),
+                                    "type": tc.get("type", "function"),
+                                    "function": {
+                                        "name": tc["function"]["name"],
+                                        "arguments": tc["function"]["arguments"]
+                                    }
+                                }
+                                for tc in sorted(tool_call_accumulator.values(), key=lambda x: x.get("id", ""))
+                            ]
+                        
+                        # Parse for tool calls
+                        tool_calls, text = self._detect_tool_calls_from_streaming_chunks(accumulated_message)
+                        
+                        # If tool calls detected, execute them
+                        if tool_calls:
+                            tool_calls_detected = tool_calls
+                            # Store any text that came before tool calls
+                            if current_text:
+                                messages.append({"role": "assistant", "content": current_text})
+                            break
+                        
+                        # If finish_reason is "stop" and no tool calls, we're done
+                        if finish_reason == "stop" and not tool_calls:
+                            # Log conversation if we have accumulated messages
+                            if messages:
+                                self.messages = messages
+                                if current_text:
+                                    messages.append({"role": "assistant", "content": current_text})
+                                await self.log_conversation()
+                            return
+                
+                # Execute detected tool calls
+                if tool_calls_detected:
+                    for tc in tool_calls_detected:
+                        name = tc.get("name")
+                        args = tc.get("arguments") or {}
+                        self.logger.info(f"[Stream] Executing tool '{name}' with args: {args}")
+                        tool_output_text = await self._execute_tool(name, args)
+                        
+                        # Append tool message to conversation
+                        messages.append({"role": "tool", "name": name, "content": tool_output_text})
+                    
+                    # After tool execution, continue streaming with tool_choice="none" for final response
+                    final_text = ""
+                    async for chunk in self._stream_llm_raw(messages, tool_choice="none"):
+                        if "choices" not in chunk or not chunk["choices"]:
+                            continue
+                        
+                        delta = chunk["choices"][0].get("delta", {})
+                        finish_reason = chunk["choices"][0].get("finish_reason")
+                        
+                        if "content" in delta and delta["content"]:
+                            content_delta = delta["content"]
+                            final_text += content_delta
+                            yield content_delta
+                        
+                        if finish_reason == "stop":
+                            # Log conversation
+                            if messages:
+                                self.messages = messages
+                                if final_text:
+                                    messages.append({"role": "assistant", "content": final_text})
+                                await self.log_conversation()
+                            return
+                else:
+                    # No tool calls, we're done
+                    if messages:
+                        self.messages = messages
+                        if current_text:
+                            messages.append({"role": "assistant", "content": current_text})
+                        await self.log_conversation()
+                    return
+            
+            # Safety: if we exit loop, log what we have
+            if messages:
+                self.messages = messages
+                if accumulated_text:
+                    messages.append({"role": "assistant", "content": accumulated_text})
+                await self.log_conversation()
+            
+        except Exception as e:
+            self.logger.error(f"[Stream] Error streaming query: {e}")
+            traceback.print_exc()
+            raise
 
     # -------------------------
     # Utilities

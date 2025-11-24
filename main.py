@@ -2,6 +2,7 @@
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Dict, Any
 from contextlib import asynccontextmanager
@@ -160,6 +161,46 @@ async def set_model(request: ModelSelectRequest):
             "selected_model": request.model,
         }
 
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Streaming chat endpoint
+@app.post("/chat/stream")
+async def chat_stream(request: QueryRequest):
+    """
+    Stream chat responses with tool call support.
+    Returns Server-Sent Events (SSE) format.
+    """
+    try:
+        async def generate_sse():
+            """Generator that yields SSE-formatted chunks."""
+            try:
+                async for chunk in app.state.client.stream_query(request.query):
+                    # Escape newlines in chunk for SSE format
+                    escaped_chunk = chunk.replace("\n", "\\n").replace("\r", "\\r")
+                    # Format as SSE: data: <chunk>\n\n
+                    yield f"data: {escaped_chunk}\n\n"
+                # Send completion marker
+                yield "data: [DONE]\n\n"
+            except Exception as e:
+                # Send error as SSE with more context
+                error_msg = str(e)
+                # Format error message for SSE
+                escaped_error = error_msg.replace("\n", "\\n").replace("\r", "\\r")
+                yield f"data: [ERROR] {escaped_error}\n\n"
+                yield "data: [DONE]\n\n"
+                # Don't re-raise to prevent double error handling
+        
+        return StreamingResponse(
+            generate_sse(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",  # Disable nginx buffering
+            }
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
