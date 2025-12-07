@@ -1,4 +1,6 @@
 # MCP Client — Two Versions (A and B)
+# Developer Note (2025-11-24): Streaming endpoints now avoid direct file IO; callers
+# enqueue conversation logs after receiving the `conversation_end` control event.
 # File: services/mcp_client.py
 # NOTE: This file implements two different workflows for tool-enabled LLMs:
 # - process_query_vA: Universal 2-step workflow (recommended)
@@ -8,6 +10,7 @@
 # Uploaded file reference (local):
 # file:///mnt/data/600aa43c-b09e-40b8-83b3-fdc338edc337.png
 
+import asyncio
 import httpx
 from typing import Optional, Any, Dict, List, Tuple, AsyncGenerator
 from contextlib import AsyncExitStack
@@ -41,6 +44,9 @@ class MCPClient:
         self.messages: List[Dict[str, Any]] = []
         self.logger = logger
         self.max_tool_iterations = int(os.getenv("MAX_TOOL_ITERATIONS", str(max_tool_iterations)))
+        self.stream_batch_size = int(os.getenv("STREAM_SERVER_BATCH_SIZE", "32"))
+        self.stream_throttle = float(os.getenv("STREAM_SERVER_THROTTLE", "0.005"))
+        self.last_conversation_snapshot: List[Dict[str, Any]] = []
 
     # -------------------------
     # MCP / Server connection
@@ -159,6 +165,23 @@ class MCPClient:
             text_result = message.get("text")
 
         return tool_calls, text_result
+
+    @staticmethod
+    def _looks_like_json(value: Any) -> bool:
+        if not isinstance(value, str):
+            return False
+        stripped = value.strip()
+        return (stripped.startswith("{") and stripped.endswith("}")) or (
+            stripped.startswith("[") and stripped.endswith("]")
+        )
+
+    def _safe_parse_arguments(self, value: Any) -> Any:
+        if isinstance(value, str) and self._looks_like_json(value):
+            try:
+                return json.loads(value)
+            except Exception:
+                return value
+        return value
 
     def _detect_tool_calls_from_streaming_chunks(
         self, accumulated_message: Dict[str, Any]
@@ -427,7 +450,7 @@ class MCPClient:
             return await self.process_query_vB(query)
 
     # -------------------------
-    # Streaming with tool call support
+    # Streaming with tool call support (legacy - accepts query string)
     # -------------------------
     async def stream_query(
         self, query: str
@@ -538,7 +561,7 @@ class MCPClient:
                                 self.messages = messages
                                 if current_text:
                                     messages.append({"role": "assistant", "content": current_text})
-                                await self.log_conversation()
+                                self.last_conversation_snapshot = [msg.copy() for msg in messages]
                             return
                 
                 # Execute detected tool calls
@@ -572,7 +595,7 @@ class MCPClient:
                                 self.messages = messages
                                 if final_text:
                                     messages.append({"role": "assistant", "content": final_text})
-                                await self.log_conversation()
+                                self.last_conversation_snapshot = [msg.copy() for msg in messages]
                             return
                 else:
                     # No tool calls, we're done
@@ -580,7 +603,7 @@ class MCPClient:
                         self.messages = messages
                         if current_text:
                             messages.append({"role": "assistant", "content": current_text})
-                        await self.log_conversation()
+                        self.last_conversation_snapshot = [msg.copy() for msg in messages]
                     return
             
             # Safety: if we exit loop, log what we have
@@ -588,10 +611,237 @@ class MCPClient:
                 self.messages = messages
                 if accumulated_text:
                     messages.append({"role": "assistant", "content": accumulated_text})
-                await self.log_conversation()
+                self.last_conversation_snapshot = [msg.copy() for msg in messages]
             
         except Exception as e:
             self.logger.error(f"[Stream] Error streaming query: {e}")
+            traceback.print_exc()
+            raise
+
+    # -------------------------
+    # WebSocket streaming with conversation history and thinking mode
+    # -------------------------
+    async def stream_chat_messages(
+        self, messages: List[Dict[str, Any]]
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Stream LLM responses from full conversation history with batching, throttling,
+        and <think> tag handling.
+        """
+        THINKING_START = "<think>"
+        THINKING_END = "</think>"
+        max_tag_len = max(len(THINKING_START), len(THINKING_END))
+        pending_text = ""
+        message_buffer = ""
+        thinking_buffer = ""
+        visible_text = ""
+        in_thinking = False
+        current_text = ""
+
+        def clean_summary(text: str) -> str:
+            # Simple summary cleaner
+            cleaned = text.replace(THINKING_START, "").replace(THINKING_END, "").strip()
+            return cleaned[:500]
+
+        def remove_thinking_blocks(text: str) -> str:
+            # Remove content between <think> and </think> (including tags)
+            # Use non-greedy match for content
+            pattern = re.compile(f"{re.escape(THINKING_START)}.*?{re.escape(THINKING_END)}", re.DOTALL)
+            return re.sub(pattern, "", text).strip()
+
+        def flush_buffer(buffer_name: str, force: bool = False):
+            nonlocal message_buffer, thinking_buffer
+            events: List[Dict[str, Any]] = []
+            buf = message_buffer if buffer_name == "message" else thinking_buffer
+            
+            # Debug log
+            # logger.info(f"[Flush] {buffer_name} force={force} buf_len={len(buf)}")
+
+            while buf:
+                if not force and len(buf) < self.stream_batch_size:
+                    break
+                chunk = buf if force or len(buf) <= self.stream_batch_size else buf[: self.stream_batch_size]
+                events.append({"type": buffer_name, "text": chunk})
+                
+                # Trace event generation
+                self.logger.info(f"[Yield] {buffer_name}: {chunk[:50]}...")
+
+                buf = buf[len(chunk):]
+                if not force:
+                    break
+            if buffer_name == "message":
+                message_buffer = buf
+            else:
+                thinking_buffer = buf
+            return events
+
+        def drain_pending(force: bool = False):
+            nonlocal pending_text, in_thinking, message_buffer, thinking_buffer, visible_text
+            events: List[Dict[str, Any]] = []
+            search_token = THINKING_END if in_thinking else THINKING_START
+
+            while pending_text:
+                idx = pending_text.find(search_token)
+                if idx == -1:
+                    safe_len = len(pending_text)
+                    if not force:
+                        safe_len = max(0, len(pending_text) - (max_tag_len - 1))
+                    if safe_len <= 0:
+                        break
+                    slice_text = pending_text[:safe_len]
+                    if in_thinking:
+                        thinking_buffer += slice_text
+                        events.extend(flush_buffer("thinking"))
+                    else:
+                        message_buffer += slice_text
+                        visible_text += slice_text
+                        events.extend(flush_buffer("message"))
+                    pending_text = pending_text[safe_len:]
+                    continue
+
+                before = pending_text[:idx]
+                if in_thinking:
+                    thinking_buffer += before
+                    events.extend(flush_buffer("thinking", force=True))
+                else:
+                    message_buffer += before
+                    visible_text += before
+                    events.extend(flush_buffer("message", force=True))
+                pending_text = pending_text[idx + len(search_token):]
+                in_thinking = not in_thinking
+                search_token = THINKING_END if in_thinking else THINKING_START
+
+            if force and pending_text:
+                if in_thinking:
+                    thinking_buffer += pending_text
+                    events.extend(flush_buffer("thinking", force=True))
+                else:
+                    message_buffer += pending_text
+                    visible_text += pending_text
+                    events.extend(flush_buffer("message", force=True))
+                pending_text = ""
+
+            return events
+
+        try:
+            self.logger.info(f"[WebSocket] Processing {len(messages)} messages")
+            conversation_messages = [msg.copy() for msg in messages]
+            iterations = 0
+            tool_choice_mode = "auto"
+
+            while iterations < self.max_tool_iterations * 2:
+                iterations += 1
+                tool_calls_detected: List[Dict[str, Any]] = []
+                tool_call_accumulator: Dict[int, Dict[str, Any]] = {}
+                current_text = ""
+                visible_text = ""
+                pending_text = ""
+                message_buffer = ""
+                thinking_buffer = ""
+                in_thinking = False
+                summary_text = ""
+                async for chunk in self._stream_llm_raw(conversation_messages, tool_choice=tool_choice_mode):
+                    if "choices" not in chunk or not chunk["choices"]:
+                        continue
+
+                    delta = chunk["choices"][0].get("delta", {})
+                    finish_reason = chunk["choices"][0].get("finish_reason")
+
+                    if "content" in delta and delta["content"]:
+                        content_delta = delta["content"]
+                        current_text += content_delta
+                        pending_text += content_delta
+                        for event in drain_pending():
+                            yield event
+                        summary_text = clean_summary(visible_text)
+
+                    if "tool_calls" in delta and delta["tool_calls"]:
+                        for tc_delta in delta["tool_calls"]:
+                            index = tc_delta.get("index", 0)
+                            if index not in tool_call_accumulator:
+                                tool_call_accumulator[index] = {
+                                    "id": "",
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                }
+                            if tc_delta.get("id"):
+                                tool_call_accumulator[index]["id"] = tc_delta["id"]
+                            if tc_delta.get("function", {}).get("name"):
+                                tool_call_accumulator[index]["function"]["name"] = tc_delta["function"]["name"]
+                            if tc_delta.get("function", {}).get("arguments"):
+                                tool_call_accumulator[index]["function"]["arguments"] += tc_delta["function"]["arguments"]
+
+                    if finish_reason:
+                        if tool_call_accumulator:
+                            tool_calls_detected = [
+                                {
+                                    "name": tc["function"]["name"],
+                                    "arguments": self._safe_parse_arguments(tc["function"]["arguments"]),
+                                }
+                                for tc in tool_call_accumulator.values()
+                            ]
+                            if current_text:
+                                conversation_messages.append({"role": "assistant", "content": current_text})
+                            break
+
+                        if finish_reason == "stop":
+                            for event in drain_pending(force=True):
+                                yield event
+                            for event in flush_buffer("thinking", force=True):
+                                yield event
+                            for event in flush_buffer("message", force=True):
+                                yield event
+
+                            if current_text:
+                                clean_text = remove_thinking_blocks(current_text)
+                                conversation_messages.append({"role": "assistant", "content": clean_text})
+                            self.messages = conversation_messages
+                            self.last_conversation_snapshot = [msg.copy() for msg in conversation_messages]
+                            yield {
+                                "type": "conversation_end",
+                                "conversation": self.last_conversation_snapshot,
+                                "summary": summary_text,
+                            }
+                            return
+
+                    if self.stream_throttle > 0:
+                        await asyncio.sleep(self.stream_throttle)
+
+                if tool_calls_detected:
+                    for tc in tool_calls_detected:
+                        name = tc.get("name")
+                        args = tc.get("arguments") or {}
+                        yield {"type": "tool_call", "tool": name, "args": args}
+                        self.logger.info(f"[WebSocket] Executing tool '{name}' with args: {args}")
+                        tool_output_text = await self._execute_tool(name, args)
+                        conversation_messages.append({"role": "tool", "name": name, "content": tool_output_text})
+                        yield {"type": "tool_result", "tool": name, "result": tool_output_text}
+
+                    tool_choice_mode = "none"
+                    continue
+
+                break
+
+            for event in drain_pending(force=True):
+                yield event
+            for event in flush_buffer("thinking", force=True):
+                yield event
+            for event in flush_buffer("message", force=True):
+                yield event
+
+            if current_text:
+                clean_text = remove_thinking_blocks(current_text)
+                conversation_messages.append({"role": "assistant", "content": clean_text})
+            self.messages = conversation_messages
+            self.last_conversation_snapshot = [msg.copy() for msg in conversation_messages]
+            yield {
+                "type": "conversation_end",
+                "conversation": self.last_conversation_snapshot,
+                "summary": clean_summary(visible_text),
+            }
+
+        except Exception as e:
+            self.logger.error(f"[WebSocket] Error streaming chat messages: {e}")
             traceback.print_exc()
             raise
 

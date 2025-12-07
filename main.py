@@ -1,16 +1,22 @@
 # main.py
+# Developer Note (2025-11-24): WebSocket streaming now runs alongside a background
+# conversation logger so that token delivery is never blocked by disk IO.
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import Dict, Any
+from typing import Dict, Any, List
 from contextlib import asynccontextmanager
 from services.mcp_client import MCPClient
 from dotenv import load_dotenv
 from pydantic_settings import BaseSettings
 import os
 import httpx
+import json
+import asyncio
+import logging
+from pathlib import Path
+from datetime import datetime
 
 # Load environment variables from a .env file
 load_dotenv()
@@ -24,8 +30,107 @@ class Settings(BaseSettings):
 # Initialize settings object
 settings = Settings()
 
+LOGGING_BACKGROUND_ENABLED = (
+    os.getenv("LOGGING_BACKGROUND", "true").lower() == "true"
+)
+ENABLE_WS_PINGS = os.getenv("ENABLE_WS_PINGS", "false").lower() == "true"
+PING_INTERVAL_SECONDS = float(os.getenv("WS_PING_INTERVAL_SECONDS", "25"))
+LOG_DIR = Path("conversations")
+LOG_DIR.mkdir(exist_ok=True)
+background_logger = logging.getLogger("ConversationLogger")
+background_logger.setLevel(logging.INFO)
+
 
 # Lifespan context manager to manage app startup and shutdown behavior
+async def _background_log_writer(queue: asyncio.Queue):
+    """
+    Persist conversation JSON payloads in the background so streaming is never blocked.
+    """
+    while True:
+        job = await queue.get()
+        if job is None:
+            queue.task_done()
+            break
+
+        filename = job.get("filename")
+        meta = job.get("meta", {})
+        conversation = job.get("conversation", [])
+
+        if not filename:
+            timestamp = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
+            filename = f"conversation_{timestamp}.json"
+
+        payload = {
+            "meta": meta,
+            "conversation": conversation,
+        }
+
+        try:
+            file_path = LOG_DIR / filename
+
+            def _write():
+                with file_path.open("w", encoding="utf-8") as file:
+                    json.dump(payload, file, indent=2, ensure_ascii=False)
+
+            await asyncio.to_thread(_write)
+        except Exception as exc:  # pragma: no cover - logging path
+            background_logger.exception("Failed to write conversation log: %s", exc)
+        finally:
+            queue.task_done()
+
+
+def serialize_conversation_for_log(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Convert potentially complex message objects into JSON-serializable dicts.
+    """
+    serialized: List[Dict[str, Any]] = []
+    for message in messages or []:
+        entry: Dict[str, Any] = {"role": message.get("role")}
+        if message.get("name"):
+            entry["name"] = message.get("name")
+
+        content = message.get("content")
+        if isinstance(content, (str, int, float, bool)) or content is None:
+            entry["content"] = content
+        elif isinstance(content, list):
+            safe_list: List[Any] = []
+            for item in content:
+                if isinstance(item, (str, int, float, bool)) or item is None:
+                    safe_list.append(item)
+                elif hasattr(item, "model_dump"):
+                    safe_list.append(item.model_dump())
+                elif hasattr(item, "dict"):
+                    safe_list.append(item.dict())
+                elif hasattr(item, "to_dict"):
+                    safe_list.append(item.to_dict())
+                else:
+                    safe_list.append(str(item))
+            entry["content"] = safe_list
+        else:
+            entry["content"] = str(content)
+        serialized.append(entry)
+    return serialized
+
+
+async def enqueue_conversation_log(app: FastAPI, conversation: List[Dict[str, Any]], meta: Dict[str, Any]):
+    """
+    Helper to push a conversation logging job into the background queue if enabled.
+    """
+    if not LOGGING_BACKGROUND_ENABLED:
+        return
+    log_queue = getattr(app.state, "log_queue", None)
+    if log_queue is None:
+        return
+    serialized = serialize_conversation_for_log(conversation)
+    filename = meta.get("filename")
+    job = {
+        "conversation": serialized,
+        "meta": meta,
+        "filename": filename,
+    }
+    await log_queue.put(job)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
@@ -42,6 +147,13 @@ async def lifespan(app: FastAPI):
 
         # Attach the client instance to the app state for global access
         app.state.client = client
+        if LOGGING_BACKGROUND_ENABLED:
+            log_queue: asyncio.Queue = asyncio.Queue()
+            app.state.log_queue = log_queue
+            app.state.log_writer_task = asyncio.create_task(_background_log_writer(log_queue))
+        else:
+            app.state.log_queue = None
+            app.state.log_writer_task = None
 
         # Yield control back to FastAPI to continue startup
         yield
@@ -54,6 +166,15 @@ async def lifespan(app: FastAPI):
     finally:
         # Clean up resources by shutting down the MCP client connection
         await client.cleanup()
+        log_queue = getattr(app.state, "log_queue", None)
+        writer_task = getattr(app.state, "log_writer_task", None)
+        if LOGGING_BACKGROUND_ENABLED and log_queue is not None and writer_task is not None:
+            await log_queue.put(None)
+            await log_queue.join()
+            try:
+                await writer_task
+            except asyncio.CancelledError:
+                pass
 
 
 # Create the FastAPI application with a custom title and lifespan manager
@@ -164,47 +285,166 @@ async def set_model(request: ModelSelectRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# WebSocket chat endpoint (patched)
+@app.websocket("/ws/chat/{conversation_id}")
+async def websocket_chat(websocket: WebSocket, conversation_id: str):
+    """
+    WebSocket endpoint for bidirectional chat streaming.
+    Handles incoming user_message payloads and streams LLM output.
+    Cancels any ongoing stream when a new `user_message` arrives.
+    """
+    await websocket.accept()
+    client = app.state.client
 
-# Streaming chat endpoint
-@app.post("/chat/stream")
-async def chat_stream(request: QueryRequest):
-    """
-    Stream chat responses with tool call support.
-    Returns Server-Sent Events (SSE) format.
-    """
-    try:
-        async def generate_sse():
-            """Generator that yields SSE-formatted chunks."""
+    # Keep a reference to the active streaming task for this connection
+    current_stream_task: asyncio.Task | None = None
+    ping_task: asyncio.Task | None = None
+    ping_enabled = ENABLE_WS_PINGS and PING_INTERVAL_SECONDS > 0
+    log_metadata_base = {"conversation_id": conversation_id}
+
+    async def maybe_enqueue_log(conversation_payload: List[Dict[str, Any]] | None, status: str, summary: str | None = None):
+        if not conversation_payload:
+            return
+        meta = {**log_metadata_base, "status": status}
+        if summary:
+            meta["summary"] = summary
+        await enqueue_conversation_log(app, conversation_payload, meta)
+
+    async def stream_and_send(messages_payload):
+        """
+        Runs the MCP client's stream generator and forwards messages over websocket.
+        This task is cancellable from the outer scope.
+        """
+        conversation_event: Dict[str, Any] | None = None
+        try:
+            # stream_chat_messages yields dict-like payloads ready to send
+            async for token_data in client.stream_chat_messages(messages_payload):
+                if token_data.get("type") == "conversation_end":
+                    conversation_event = token_data
+                    continue
+                # Ensure we only send if connection still open
+                try:
+                    await websocket.send_json(token_data)
+                except Exception:
+                    # If send fails (disconnected), just stop streaming
+                    break
+            # When generator finishes normally, send done
             try:
-                async for chunk in app.state.client.stream_query(request.query):
-                    # Escape newlines in chunk for SSE format
-                    escaped_chunk = chunk.replace("\n", "\\n").replace("\r", "\\r")
-                    # Format as SSE: data: <chunk>\n\n
-                    yield f"data: {escaped_chunk}\n\n"
-                # Send completion marker
-                yield "data: [DONE]\n\n"
-            except Exception as e:
-                # Send error as SSE with more context
-                error_msg = str(e)
-                # Format error message for SSE
-                escaped_error = error_msg.replace("\n", "\\n").replace("\r", "\\r")
-                yield f"data: [ERROR] {escaped_error}\n\n"
-                yield "data: [DONE]\n\n"
-                # Don't re-raise to prevent double error handling
-        
-        return StreamingResponse(
-            generate_sse(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",  # Disable nginx buffering
-            }
-        )
+                await websocket.send_json({"type": "done"})
+            except Exception:
+                pass
+            if conversation_event:
+                await maybe_enqueue_log(
+                    conversation_event.get("conversation"),
+                    status="completed",
+                    summary=conversation_event.get("summary"),
+                )
+        except asyncio.CancelledError:
+            # Task was cancelled (e.g., new user_message arrived)
+            # Optionally inform client that stream was cancelled
+            try:
+                await websocket.send_json({"type": "cancelled"})
+            except Exception:
+                pass
+            if conversation_event:
+                await maybe_enqueue_log(
+                    conversation_event.get("conversation"),
+                    status="cancelled",
+                    summary=conversation_event.get("summary"),
+                )
+            else:
+                await maybe_enqueue_log(messages_payload, status="cancelled_no_snapshot")
+            raise
+        except Exception as e:
+            # Unexpected error during streaming
+            try:
+                await websocket.send_json({"type": "error", "message": str(e)})
+            except Exception:
+                pass
+            if conversation_event:
+                await maybe_enqueue_log(
+                    conversation_event.get("conversation"),
+                    status="error",
+                    summary=conversation_event.get("summary"),
+                )
+            else:
+                await maybe_enqueue_log(messages_payload, status="error_no_snapshot")
+            raise
+
+    try:
+        if ping_enabled:
+            async def ping_loop():
+                try:
+                    while True:
+                        await asyncio.sleep(PING_INTERVAL_SECONDS)
+                        await websocket.send_json({"type": "ping"})
+                except Exception:
+                    return
+
+            ping_task = asyncio.create_task(ping_loop())
+
+        # Keep receiving messages from client for the lifetime of the WS connection
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                message_data = json.loads(raw)
+            except json.JSONDecodeError:
+                await websocket.send_json({"type": "error", "message": "Invalid JSON"})
+                continue
+
+            msg_type = message_data.get("type")
+
+            if msg_type == "user_message":
+                # Cancel existing streaming task if running
+                if current_stream_task and not current_stream_task.done():
+                    current_stream_task.cancel()
+                    # give the task a short moment to cancel cleanly
+                    try:
+                        await asyncio.wait_for(current_stream_task, timeout=1.0)
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        # If it didn't finish, we continue anyway because we'll start a new one
+                        pass
+
+                # Validate messages payload
+                messages_payload = message_data.get("messages", [])
+                if not isinstance(messages_payload, list) or len(messages_payload) == 0:
+                    await websocket.send_json({"type": "error", "message": "No messages provided"})
+                    continue
+
+                # Launch new streaming task
+                current_stream_task = asyncio.create_task(stream_and_send(messages_payload))
+
+            elif msg_type == "cancel":
+                # If client sends explicit cancel request, cancel task
+                if current_stream_task and not current_stream_task.done():
+                    current_stream_task.cancel()
+                    try:
+                        await asyncio.wait_for(current_stream_task, timeout=1.0)
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        pass
+                    await websocket.send_json({"type": "cancelled_by_client"})
+
+            else:
+                # Unknown message type: echo error
+                await websocket.send_json({"type": "error", "message": f"Unknown message type: {msg_type}"})
+
+    except WebSocketDisconnect:
+        # If client disconnects, cancel the running streaming task (if any)
+        if current_stream_task and not current_stream_task.done():
+            current_stream_task.cancel()
+        return
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
+        # If any other exception occurs, try to notify client and cleanup
+        try:
+            await websocket.send_json({"type": "error", "message": str(e)})
+        except Exception:
+            pass
+        if current_stream_task and not current_stream_task.done():
+            current_stream_task.cancel()
+        raise
+    finally:
+        if ping_task and not ping_task.done():
+            ping_task.cancel()
 # Entry point to run the application with Uvicorn when executed directly -> uv run uvicorn main:app --reload
 if __name__ == "__main__":
     import uvicorn
