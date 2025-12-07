@@ -18,7 +18,7 @@ import traceback
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from datetime import datetime
-from utils.logger import logger
+
 import json
 import os
 import re
@@ -42,7 +42,7 @@ class MCPClient:
         self.model = os.getenv("DEFAULT_MODEL", "qwen/qwen3-1.7b")
         self.tools = []
         self.messages: List[Dict[str, Any]] = []
-        self.logger = logger
+
         self.max_tool_iterations = int(os.getenv("MAX_TOOL_ITERATIONS", str(max_tool_iterations)))
         self.stream_batch_size = int(os.getenv("STREAM_SERVER_BATCH_SIZE", "32"))
         self.stream_throttle = float(os.getenv("STREAM_SERVER_THROTTLE", "0.005"))
@@ -65,7 +65,8 @@ class MCPClient:
 
             self.session = await self.exit_stack.enter_async_context(ClientSession(self.stdio, self.write))
             await self.session.initialize()
-            self.logger.info("Connected to MCP server")
+            # self.logger.info("Connected to MCP server")
+
 
             # Load tools
             mcp_tools = await self.get_mcp_tools()
@@ -81,12 +82,13 @@ class MCPClient:
                 }
 
             self.tools = [convert_tool_to_openai(t) for t in mcp_tools]
-            self.logger.info(f"Available tools: {[t['function']['name'] for t in self.tools]}")
+            # self.logger.info(f"Available tools: {[t['function']['name'] for t in self.tools]}")
+
 
             return True
 
         except Exception as e:
-            self.logger.error(f"Error connecting to MCP server: {e}")
+            print(f"Error connecting to MCP server: {e}")
             traceback.print_exc()
             raise
 
@@ -95,7 +97,7 @@ class MCPClient:
             response = await self.session.list_tools()
             return response.tools
         except Exception as e:
-            self.logger.error(f"Error getting MCP tools: {e}")
+            print(f"Error getting MCP tools: {e}")
             raise
 
     # -------------------------
@@ -230,7 +232,7 @@ class MCPClient:
                 return str(content)
 
         except Exception as e:
-            self.logger.error(f"Error calling tool {tool_name}: {e}")
+            print(f"Error calling tool {tool_name}: {e}")
             raise
 
     # -------------------------
@@ -297,7 +299,8 @@ class MCPClient:
                             yield chunk
                         except json.JSONDecodeError:
                             # Skip malformed JSON chunks
-                            self.logger.debug(f"Skipping malformed chunk: {data_str}")
+                            # self.logger.debug(f"Skipping malformed chunk: {data_str}")
+
                             continue
         except httpx.ConnectError as e:
             error_msg = (
@@ -305,14 +308,14 @@ class MCPClient:
                 f"Please ensure LM Studio (or your LLM server) is running and accessible. "
                 f"Error: {str(e)}"
             )
-            self.logger.error(error_msg)
+            print(error_msg)
             raise ConnectionError(error_msg) from e
         except httpx.HTTPStatusError as e:
             error_msg = (
                 f"LLM server returned error status {e.response.status_code}. "
                 f"Response: {e.response.text[:200]}"
             )
-            self.logger.error(error_msg)
+            print(error_msg)
             raise RuntimeError(error_msg) from e
 
     # -------------------------
@@ -326,7 +329,7 @@ class MCPClient:
         4) Return full conversation log as a list of messages.
         """
         try:
-            self.logger.info(f"[vA] Processing query: {query}")
+
             self.messages = [{"role": "user", "content": query}]
 
             # first call: allow model to choose tools
@@ -347,7 +350,7 @@ class MCPClient:
                 for tc in tool_calls:
                     name = tc.get("name")
                     args = tc.get("arguments") or {}
-                    self.logger.info(f"[vA] Executing tool '{name}' with args: {args}")
+
                     tool_output_text = await self._execute_tool(name, args)
 
                     # Append tool message(s) to conversation so LLM can see the result
@@ -373,7 +376,7 @@ class MCPClient:
             return self.messages
 
         except Exception as e:
-            self.logger.error(f"[vA] Error processing query: {e}")
+            print(f"[vA] Error processing query: {e}")
             raise
 
     # -------------------------
@@ -386,7 +389,7 @@ class MCPClient:
         Adds iteration limits and safer parsing.
         """
         try:
-            self.logger.info(f"[vB] Processing query: {query}")
+
             self.messages = [{"role": "user", "content": query}]
 
             iterations = 0
@@ -410,7 +413,8 @@ class MCPClient:
                     for tc in tool_calls:
                         name = tc.get("name")
                         args = tc.get("arguments") or {}
-                        self.logger.info(f"[vB] Calling tool {name} with args {args}")
+                        # self.logger.info(f"[vB] Calling tool {name} with args {args}")
+
                         tool_output_text = await self._execute_tool(name, args)
 
                         # Append tool output so the model can use it next turn
@@ -432,13 +436,13 @@ class MCPClient:
                     continue
 
                 # Safety fallback
-                self.logger.info("[vB] No tool_calls and no text returned; breaking")
+
                 break
 
             return self.messages
 
         except Exception as e:
-            self.logger.error(f"[vB] Error processing query: {e}")
+            print(f"[vB] Error processing query: {e}")
             raise
 
 
@@ -470,7 +474,7 @@ class MCPClient:
         Yields plain text tokens.
         """
         try:
-            self.logger.info(f"[Stream] Processing query: {query}")
+
             messages = [{"role": "user", "content": query}]
             
             iterations = 0
@@ -569,7 +573,7 @@ class MCPClient:
                     for tc in tool_calls_detected:
                         name = tc.get("name")
                         args = tc.get("arguments") or {}
-                        self.logger.info(f"[Stream] Executing tool '{name}' with args: {args}")
+
                         tool_output_text = await self._execute_tool(name, args)
                         
                         # Append tool message to conversation
@@ -614,7 +618,7 @@ class MCPClient:
                 self.last_conversation_snapshot = [msg.copy() for msg in messages]
             
         except Exception as e:
-            self.logger.error(f"[Stream] Error streaming query: {e}")
+            print(f"[Stream] Error streaming query: {e}")
             traceback.print_exc()
             raise
 
@@ -664,7 +668,7 @@ class MCPClient:
                 events.append({"type": buffer_name, "text": chunk})
                 
                 # Trace event generation
-                self.logger.info(f"[Yield] {buffer_name}: {chunk[:50]}...")
+
 
                 buf = buf[len(chunk):]
                 if not force:
@@ -724,7 +728,7 @@ class MCPClient:
             return events
 
         try:
-            self.logger.info(f"[WebSocket] Processing {len(messages)} messages")
+
             conversation_messages = [msg.copy() for msg in messages]
             iterations = 0
             tool_choice_mode = "auto"
@@ -812,7 +816,8 @@ class MCPClient:
                         name = tc.get("name")
                         args = tc.get("arguments") or {}
                         yield {"type": "tool_call", "tool": name, "args": args}
-                        self.logger.info(f"[WebSocket] Executing tool '{name}' with args: {args}")
+                        # self.logger.info(f"[WebSocket] Executing tool '{name}' with args: {args}")
+
                         tool_output_text = await self._execute_tool(name, args)
                         conversation_messages.append({"role": "tool", "name": name, "content": tool_output_text})
                         yield {"type": "tool_result", "tool": name, "result": tool_output_text}
@@ -841,7 +846,7 @@ class MCPClient:
             }
 
         except Exception as e:
-            self.logger.error(f"[WebSocket] Error streaming chat messages: {e}")
+            print(f"[WebSocket] Error streaming chat messages: {e}")
             traceback.print_exc()
             raise
 
@@ -850,15 +855,16 @@ class MCPClient:
     # -------------------------
     async def call_llm(self, messages: List[Dict[str, Any]], tool_choice: str = "auto") -> Dict[str, Any]:
         """Public wrapper for _call_llm_raw that logs and returns JSON."""
-        self.logger.info(f"Calling LLM (model={self.model}, tool_choice={tool_choice}) with {len(messages)} messages")
+        # self.logger.info(f"Calling LLM (model={self.model}, tool_choice={tool_choice}) with {len(messages)} messages")
+
         return await self._call_llm_raw(messages, tool_choice=tool_choice)
 
     async def cleanup(self):
         try:
             await self.exit_stack.aclose()
-            self.logger.info("Disconnected from MCP server")
+
         except Exception as e:
-            self.logger.error(f"Error during cleanup: {e}")
+            print(f"Error during cleanup: {e}")
             traceback.print_exc()
             raise
 
@@ -890,8 +896,8 @@ class MCPClient:
                 serializable_conversation.append(serializable_message)
 
             except Exception as e:
-                self.logger.error(f"Error processing message: {str(e)}")
-                self.logger.debug(f"Message content: {message}")
+                print(f"Error processing message: {str(e)}")
+
                 raise
 
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -900,10 +906,11 @@ class MCPClient:
         try:
             with open(filepath, "w") as f:
                 json.dump(serializable_conversation, f, indent=2, default=str)
-            self.logger.info(f"Conversation logged to {filepath}")
+            # self.logger.info(f"Conversation logged to {filepath}")
+
         except Exception as e:
-            self.logger.error(f"Error writing conversation to file: {str(e)}")
-            self.logger.debug(f"Serializable conversation: {serializable_conversation}")
+            print(f"Error writing conversation to file: {str(e)}")
+
             raise
 
 

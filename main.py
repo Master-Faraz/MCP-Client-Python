@@ -37,8 +37,8 @@ ENABLE_WS_PINGS = os.getenv("ENABLE_WS_PINGS", "false").lower() == "true"
 PING_INTERVAL_SECONDS = float(os.getenv("WS_PING_INTERVAL_SECONDS", "25"))
 LOG_DIR = Path("conversations")
 LOG_DIR.mkdir(exist_ok=True)
-background_logger = logging.getLogger("ConversationLogger")
-background_logger.setLevel(logging.INFO)
+LOG_DIR = Path("conversations")
+LOG_DIR.mkdir(exist_ok=True)
 
 
 # Lifespan context manager to manage app startup and shutdown behavior
@@ -74,7 +74,7 @@ async def _background_log_writer(queue: asyncio.Queue):
 
             await asyncio.to_thread(_write)
         except Exception as exc:  # pragma: no cover - logging path
-            background_logger.exception("Failed to write conversation log: %s", exc)
+            print(f"Failed to write conversation log: {exc}")
         finally:
             queue.task_done()
 
